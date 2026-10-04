@@ -1,0 +1,11 @@
+inherited/
+isolated/
+comparison_results/
+dn_generic.in
+
+__pycache__/
+*.pyc
+
+*.out
+*.err
+*.log
