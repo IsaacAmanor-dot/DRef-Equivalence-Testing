@@ -1,11 +1,6 @@
-inherited/
-isolated/
+runs/
 comparison_results/
-dn_generic.in
-
+workflow_backup/
 __pycache__/
 *.pyc
-
-*.out
-*.err
-*.log
+*.zip

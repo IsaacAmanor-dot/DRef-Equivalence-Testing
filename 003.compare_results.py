@@ -1,528 +1,200 @@
 #!/usr/bin/env python3
-
+"""Compare each inherited/isolated system-anchor pair and summarize equivalence."""
 from pathlib import Path
+import csv
 import hashlib
 import math
-import os
 import re
 import sys
 
-
 ROOT = Path(__file__).resolve().parent
-
-INHERITED = ROOT / "inherited" / "system"
-ISOLATED = ROOT / "isolated" / "system"
-RESULTS = ROOT / "comparison_results"
-
-REPORT = RESULTS / "equivalence_report.txt"
-
-COORD_TOL = 1.0e-6
-CHARGE_TOL = 1.0e-6
-NUMERIC_TOL = 1.0e-6
-
-FINAL_MOL2 = "output.denovo_build.mol2"
+RUNS = ROOT / 'runs'
+RESULTS = ROOT / 'comparison_results'
+TOL = 1e-6
 
 
-def sha256(path):
-    h = hashlib.sha256()
-
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            h.update(block)
-
-    return h.hexdigest()
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def split_mol2(path):
-    text = path.read_text(errors="replace")
-
-    marker = "@<TRIPOS>MOLECULE"
-
-    chunks = text.split(marker)
-
-    return [
-        marker + chunk
-        for chunk in chunks[1:]
-        if chunk.strip()
-    ]
+def parameter(path, key):
+    values = [f[1] for line in path.read_text().splitlines()
+              if (f := line.split()) and len(f) > 1 and f[0] == key]
+    if len(values) != 1:
+        raise ValueError(f'Expected one {key}: {path}')
+    return values[0]
 
 
-def section_lines(block, section):
-    marker = f"@<TRIPOS>{section}"
+def split_molecules(path):
+    text = path.read_text(errors='replace')
+    return ['@<TRIPOS>MOLECULE' + x for x in text.split('@<TRIPOS>MOLECULE')[1:] if x.strip()]
 
-    if marker not in block:
+
+def section(molecule, name):
+    marker = f'@<TRIPOS>{name}'
+    if marker not in molecule:
         return []
-
-    part = block.split(marker, 1)[1]
-
-    next_section = re.search(r"\n@<TRIPOS>", part)
-
-    if next_section:
-        part = part[:next_section.start()]
-
-    return [
-        line.strip()
-        for line in part.splitlines()
-        if line.strip()
-    ]
+    piece = molecule.split(marker, 1)[1]
+    piece = re.split(r'\n@<TRIPOS>', piece, maxsplit=1)[0]
+    return [line.split() for line in piece.splitlines() if line.strip()]
 
 
-def molecule_name(block):
-    lines = block.splitlines()
-
-    for i, line in enumerate(lines):
-        if line.strip() == "@<TRIPOS>MOLECULE":
-            if i + 1 < len(lines):
-                return lines[i + 1].strip()
-
-    return ""
+def properties(molecule):
+    props = {}
+    for line in molecule.splitlines():
+        if line.lstrip().startswith('##########') and ':' in line:
+            k, v = line.strip().lstrip('#').strip().split(':', 1)
+            props.setdefault(k.strip(), []).append(v.strip())
+    return props
 
 
-def parse_atoms(block):
-    atoms = []
-
-    for line in section_lines(block, "ATOM"):
-        fields = line.split()
-
-        if len(fields) < 6:
-            continue
-
-        atom = {
-            "id": int(fields[0]),
-            "name": fields[1],
-            "x": float(fields[2]),
-            "y": float(fields[3]),
-            "z": float(fields[4]),
-            "type": fields[5],
-            "charge": float(fields[8]) if len(fields) > 8 else None,
-        }
-
-        atoms.append(atom)
-
-    return atoms
-
-
-def parse_bonds(block):
-    bonds = []
-
-    for line in section_lines(block, "BOND"):
-        fields = line.split()
-
-        if len(fields) < 4:
-            continue
-
-        bonds.append(
-            (
-                int(fields[0]),
-                int(fields[1]),
-                int(fields[2]),
-                fields[3],
-            )
-        )
-
-    return bonds
-
-
-def parse_properties(block):
-    properties = {}
-
-    for line in block.splitlines():
-        stripped = line.strip()
-
-        if not stripped.startswith("##########"):
-            continue
-
-        payload = stripped.lstrip("#").strip()
-
-        if ":" in payload:
-            key, value = payload.split(":", 1)
-            properties.setdefault(key.strip(), []).append(value.strip())
-
-    return properties
-
-
-def compare_numeric_text(a, b, tol):
+def near(a, b):
     try:
-        av = float(a)
-        bv = float(b)
-    except ValueError:
+        return math.isclose(float(a), float(b), abs_tol=TOL, rel_tol=TOL)
+    except (TypeError, ValueError):
         return a == b
 
-    return math.isclose(av, bv, rel_tol=tol, abs_tol=tol)
 
-
-def compare_properties(a, b):
-    differences = []
-
-    keys = sorted(set(a) | set(b))
-
-    for key in keys:
-        va = a.get(key)
-        vb = b.get(key)
-
-        if va is None or vb is None:
-            differences.append(f"property missing: {key}")
-            continue
-
-        if len(va) != len(vb):
-            differences.append(
-                f"property count differs: {key} "
-                f"({len(va)} vs {len(vb)})"
-            )
-            continue
-
-        for index, (x, y) in enumerate(zip(va, vb), start=1):
-            if not compare_numeric_text(x, y, NUMERIC_TOL):
-                differences.append(
-                    f"property differs: {key}[{index}] "
-                    f"({x} vs {y})"
-                )
-
-    return differences
-
-
-def compare_molecule(block_a, block_b, index):
-    differences = []
-
-    name_a = molecule_name(block_a)
-    name_b = molecule_name(block_b)
-
+def compare_molecule(a, b):
+    errors, distances, score_differences = [], [], []
+    name_a = a.splitlines()[1].strip() if len(a.splitlines()) > 1 else ''
+    name_b = b.splitlines()[1].strip() if len(b.splitlines()) > 1 else ''
     if name_a != name_b:
-        differences.append(
-            f"molecule {index}: name differs "
-            f"({name_a!r} vs {name_b!r})"
-        )
+        errors.append('molecule name')
+    aa, ab = section(a, 'ATOM'), section(b, 'ATOM')
+    if len(aa) != len(ab):
+        errors.append('atom count')
+    for x, y in zip(aa, ab):
+        if len(x) < 6 or len(y) < 6:
+            errors.append('malformed atom record')
+            continue
+        if x[0:2] != y[0:2] or x[5] != y[5] or (x[6:8] != y[6:8]):
+            errors.append('atom identity/type')
+        for i in (2, 3, 4):
+            if not near(x[i], y[i]):
+                errors.append('coordinate')
+        d2 = sum((float(x[i]) - float(y[i])) ** 2 for i in (2, 3, 4))
+        distances.append(d2)
+        if len(x) > 8 or len(y) > 8:
+            if len(x) <= 8 or len(y) <= 8 or not near(x[8], y[8]):
+                errors.append('charge')
+    if section(a, 'BOND') != section(b, 'BOND'):
+        errors.append('bond definitions')
+    pa, pb = properties(a), properties(b)
+    if pa.keys() != pb.keys():
+        errors.append('property keys')
+    for key in pa.keys() & pb.keys():
+        if len(pa[key]) != len(pb[key]):
+            errors.append('property count: ' + key)
+            continue
+        for x, y in zip(pa[key], pb[key]):
+            if not near(x, y):
+                errors.append('property: ' + key)
+            if 'score' in key.lower():
+                try:
+                    score_differences.append(float(y) - float(x))
+                except ValueError:
+                    pass
+    return errors, distances, score_differences
 
-    atoms_a = parse_atoms(block_a)
-    atoms_b = parse_atoms(block_b)
 
-    if len(atoms_a) != len(atoms_b):
-        differences.append(
-            f"molecule {index}: atom count differs "
-            f"({len(atoms_a)} vs {len(atoms_b)})"
-        )
+def compare_pair(system, anchor):
+    left = RUNS / 'inherited' / system / f'anc_{anchor}'
+    right = RUNS / 'isolated' / system / f'anc_{anchor}'
+    outdir = RESULTS / system / f'anc_{anchor}'
+    outdir.mkdir(parents=True, exist_ok=True)
+    errors, distances, score_differences = [], [], []
+    if not (left / '.success').is_file() or not (right / '.success').is_file():
+        errors.append('One or both runs lack a success marker')
+    if not (left / 'dn_generic.in').is_file() or not (right / 'dn_generic.in').is_file():
+        errors.append('Input missing')
+        prefix = None
     else:
-        for atom_a, atom_b in zip(atoms_a, atoms_b):
-
-            if atom_a["id"] != atom_b["id"]:
-                differences.append(
-                    f"molecule {index}: atom ID differs "
-                    f"({atom_a['id']} vs {atom_b['id']})"
-                )
-
-            if atom_a["name"] != atom_b["name"]:
-                differences.append(
-                    f"molecule {index} atom {atom_a['id']}: "
-                    f"name differs"
-                )
-
-            if atom_a["type"] != atom_b["type"]:
-                differences.append(
-                    f"molecule {index} atom {atom_a['id']}: "
-                    f"type differs"
-                )
-
-            for axis in ("x", "y", "z"):
-                if not math.isclose(
-                    atom_a[axis],
-                    atom_b[axis],
-                    rel_tol=COORD_TOL,
-                    abs_tol=COORD_TOL,
-                ):
-                    differences.append(
-                        f"molecule {index} atom {atom_a['id']}: "
-                        f"{axis} differs "
-                        f"({atom_a[axis]} vs {atom_b[axis]})"
-                    )
-
-            qa = atom_a["charge"]
-            qb = atom_b["charge"]
-
-            if qa is None or qb is None:
-                if qa != qb:
-                    differences.append(
-                        f"molecule {index} atom {atom_a['id']}: "
-                        "charge field differs"
-                    )
-            elif not math.isclose(
-                qa,
-                qb,
-                rel_tol=CHARGE_TOL,
-                abs_tol=CHARGE_TOL,
-            ):
-                differences.append(
-                    f"molecule {index} atom {atom_a['id']}: "
-                    f"charge differs ({qa} vs {qb})"
-                )
-
-    bonds_a = parse_bonds(block_a)
-    bonds_b = parse_bonds(block_b)
-
-    if bonds_a != bonds_b:
-        differences.append(
-            f"molecule {index}: bond definitions differ"
-        )
-
-    properties_a = parse_properties(block_a)
-    properties_b = parse_properties(block_b)
-
-    for item in compare_properties(properties_a, properties_b):
-        differences.append(f"molecule {index}: {item}")
-
-    return differences
-
-
-def compare_mol2(path_a, path_b):
-    molecules_a = split_mol2(path_a)
-    molecules_b = split_mol2(path_b)
-
-    differences = []
-
-    if len(molecules_a) != len(molecules_b):
-        differences.append(
-            f"molecule count differs: "
-            f"{len(molecules_a)} vs {len(molecules_b)}"
-        )
-        return differences, len(molecules_a), len(molecules_b)
-
-    for index, (mol_a, mol_b) in enumerate(
-        zip(molecules_a, molecules_b),
-        start=1,
-    ):
-        differences.extend(
-            compare_molecule(mol_a, mol_b, index)
-        )
-
-    return differences, len(molecules_a), len(molecules_b)
-
-
-def generated_mol2_files(directory):
-    return {
-        path.name: path
-        for path in directory.glob("output*.mol2")
-        if path.is_file()
-    }
-
-
-def write(line="", report=None):
-    print(line)
-
-    if report is not None:
-        report.write(line + "\n")
+        if sha(left / 'dn_generic.in') != sha(right / 'dn_generic.in'):
+            errors.append('Inputs have different hashes')
+        prefix = parameter(left / 'dn_generic.in', 'dn_output_prefix')
+    files_a = {p.name: p for p in left.glob('*.mol2') if p.is_file()}
+    files_b = {p.name: p for p in right.glob('*.mol2') if p.is_file()}
+    if set(files_a) != set(files_b):
+        errors.append('MOL2 filename sets differ: inherited-only=' +
+                      str(sorted(set(files_a) - set(files_b))) + '; isolated-only=' +
+                      str(sorted(set(files_b) - set(files_a))))
+    common = sorted(set(files_a) & set(files_b))
+    if not common:
+        errors.append('No common MOL2 results')
+    final_names = [n for n in common if 'denovo_build' in n and n.endswith('.mol2')]
+    if not final_names:
+        errors.append('No common final denovo_build MOL2 file')
+    if prefix and not any(n.startswith(prefix) for n in common):
+        errors.append('No MOL2 output uses configured dn_output_prefix')
+    growth = []
+    tree = []
+    final_a = final_b = 0
+    for name in common:
+        molecules_a = split_molecules(files_a[name])
+        molecules_b = split_molecules(files_b[name])
+        if len(molecules_a) != len(molecules_b):
+            errors.append(f'{name}: molecule count {len(molecules_a)} != {len(molecules_b)}')
+        if 'root_layer_' in name:
+            growth.append((name, len(molecules_a), len(molecules_b)))
+        if 'growth_tree_' in name:
+            tree.append((name, len(molecules_a), len(molecules_b)))
+        if name in final_names:
+            final_a += len(molecules_a)
+            final_b += len(molecules_b)
+        for index, (ma, mb) in enumerate(zip(molecules_a, molecules_b), 1):
+            faults, ds, ss = compare_molecule(ma, mb)
+            if faults:
+                errors.append(f'{name}: molecule {index}: {", ".join(sorted(set(faults)))}')
+            if name in final_names:
+                distances.extend(ds)
+                score_differences.extend(ss)
+    if not growth:
+        errors.append('No growth-layer files found')
+    if not tree:
+        errors.append('No growth-tree files found')
+    if not score_differences:
+        errors.append('No comparable numerical score properties found')
+    rmsd = math.sqrt(sum(distances) / len(distances)) if distances else math.nan
+    mae = sum(abs(d) for d in score_differences) / len(score_differences) if score_differences else math.nan
+    rmse = math.sqrt(sum(d * d for d in score_differences) / len(score_differences)) if score_differences else math.nan
+    result = 'PASS' if not errors else 'FAIL'
+    report = [f'System: {system}', f'Anchor: {anchor}', f'Overall: {result}',
+              f'Inherited final molecules: {final_a}', f'Isolated final molecules: {final_b}',
+              f'Growth layer files: {len(growth)}', f'Growth tree files: {len(tree)}',
+              f'Coordinate RMSD (A): {rmsd}', f'Score MAE: {mae}', f'Score RMSE: {rmse}',
+              'Growth populations: ' + repr(growth), 'Growth trees: ' + repr(tree),
+              'Differences:'] + (errors if errors else ['None'])
+    (outdir / 'equivalence_report.txt').write_text('\n'.join(report) + '\n')
+    return [system, anchor, result, final_a, final_b, len(growth), len(tree), rmsd, mae, rmse, len(errors)]
 
 
 def main():
+    tasks = RUNS / 'tasks.tsv'
+    if not tasks.is_file():
+        raise SystemExit('ERROR: Run 001.setup_test.sh first')
     RESULTS.mkdir(parents=True, exist_ok=True)
-
-    failures = []
-    warnings = []
-
-    with REPORT.open("w") as report:
-
-        write("DRef Equivalence Test", report)
-        write("", report)
-
-        inherited_success = (INHERITED / ".success").exists()
-        isolated_success = (ISOLATED / ".success").exists()
-
-        write(
-            f"Inherited execution: "
-            f"{'PASS' if inherited_success else 'FAIL'}",
-            report,
-        )
-
-        write(
-            f"Isolated execution:  "
-            f"{'PASS' if isolated_success else 'FAIL'}",
-            report,
-        )
-
-        if not inherited_success:
-            failures.append("Inherited calculation did not complete.")
-
-        if not isolated_success:
-            failures.append("Isolated calculation did not complete.")
-
-        input_a = INHERITED / "dn_generic.in"
-        input_b = ISOLATED / "dn_generic.in"
-
-        if input_a.exists() and input_b.exists():
-
-            hash_a = sha256(input_a)
-            hash_b = sha256(input_b)
-
-            input_equal = hash_a == hash_b
-
-            write("", report)
-            write(
-                f"Input files:         "
-                f"{'PASS' if input_equal else 'FAIL'}",
-                report,
-            )
-            write(f"Inherited SHA256:   {hash_a}", report)
-            write(f"Isolated SHA256:    {hash_b}", report)
-
-            if not input_equal:
-                failures.append(
-                    "Inherited and isolated input files differ."
-                )
-
-        else:
-            failures.append("One or both input files are missing.")
-
-        inherited_files = generated_mol2_files(INHERITED)
-        isolated_files = generated_mol2_files(ISOLATED)
-
-        names_a = set(inherited_files)
-        names_b = set(isolated_files)
-
-        write("", report)
-        write(
-            f"Generated MOL2 files: "
-            f"{len(names_a)} inherited, "
-            f"{len(names_b)} isolated",
-            report,
-        )
-
-        missing_isolated = sorted(names_a - names_b)
-        missing_inherited = sorted(names_b - names_a)
-
-        if missing_isolated:
-            failures.append(
-                "Missing from isolated: "
-                + ", ".join(missing_isolated)
-            )
-
-        if missing_inherited:
-            failures.append(
-                "Missing from inherited: "
-                + ", ".join(missing_inherited)
-            )
-
-        common_files = sorted(names_a & names_b)
-
-        structural_failures = 0
-        exact_matches = 0
-
-        write("", report)
-        write("MOL2 comparison", report)
-
-        for name in common_files:
-
-            path_a = inherited_files[name]
-            path_b = isolated_files[name]
-
-            exact = sha256(path_a) == sha256(path_b)
-
-            differences, count_a, count_b = compare_mol2(
-                path_a,
-                path_b,
-            )
-
-            structural_equal = len(differences) == 0
-
-            if exact:
-                exact_matches += 1
-
-            if not structural_equal:
-                structural_failures += 1
-
-            write(
-                f"{name}: "
-                f"molecules={count_a}/{count_b}, "
-                f"structural="
-                f"{'PASS' if structural_equal else 'FAIL'}, "
-                f"byte="
-                f"{'PASS' if exact else 'DIFFERENT'}",
-                report,
-            )
-
-            if differences:
-                for difference in differences[:25]:
-                    write(f"  {difference}", report)
-
-                if len(differences) > 25:
-                    write(
-                        f"  ... {len(differences) - 25} "
-                        f"additional differences",
-                        report,
-                    )
-
-        final_a = INHERITED / FINAL_MOL2
-        final_b = ISOLATED / FINAL_MOL2
-
-        if not final_a.exists():
-            failures.append(
-                f"Inherited final MOL2 missing: {FINAL_MOL2}"
-            )
-
-        if not final_b.exists():
-            failures.append(
-                f"Isolated final MOL2 missing: {FINAL_MOL2}"
-            )
-
-        if structural_failures:
-            failures.append(
-                f"{structural_failures} common MOL2 file(s) "
-                "failed structural equivalence."
-            )
-
-        if common_files and exact_matches != len(common_files):
-            warnings.append(
-                f"{len(common_files) - exact_matches} common MOL2 "
-                "file(s) were structurally equivalent but not "
-                "byte-identical."
-            )
-
-        write("", report)
-        write("Summary", report)
-        write(
-            f"Common MOL2 files:    {len(common_files)}",
-            report,
-        )
-        write(
-            f"Byte-identical MOL2:  {exact_matches}",
-            report,
-        )
-        write(
-            f"Structural failures:  {structural_failures}",
-            report,
-        )
-
-        if warnings:
-            write("", report)
-            write("Warnings", report)
-
-            for warning in warnings:
-                write(f"- {warning}", report)
-
-        write("", report)
-
-        if failures:
-            write("OVERALL RESULT: FAIL", report)
-            write("", report)
-
-            for failure in failures:
-                write(f"- {failure}", report)
-
-            result = 1
-
-        else:
-            write("OVERALL RESULT: PASS", report)
-            write(
-                "The isolated implementation is structurally "
-                "equivalent to the inherited implementation "
-                "for this test case.",
-                report,
-            )
-
-            result = 0
-
-        write("", report)
-        write(f"Report: {REPORT}", report)
-
-    return result
+    rows = []
+    for line in tasks.read_text().splitlines():
+        system, anchor = line.split('\t')
+        try:
+            row = compare_pair(system, anchor)
+        except Exception as exc:
+            folder = RESULTS / system / f'anc_{anchor}'
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / 'equivalence_report.txt').write_text(f'FAIL: {exc}\n')
+            row = [system, anchor, 'FAIL', '', '', '', '', '', '', '', str(exc)]
+        rows.append(row)
+        print(system, 'anc_' + anchor, row[2])
+    with (RESULTS / 'equivalence_summary.csv').open('w', newline='') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(['system', 'anchor', 'equivalence', 'inherited_final_molecules',
+                         'isolated_final_molecules', 'growth_layer_files', 'growth_tree_files',
+                         'coordinate_rmsd_A', 'score_mae', 'score_rmse', 'differences'])
+        writer.writerows(rows)
+    print('Report:', RESULTS / 'equivalence_summary.csv')
+    return int(any(row[2] != 'PASS' for row in rows) or not rows)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

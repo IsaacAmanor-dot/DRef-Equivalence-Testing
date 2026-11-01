@@ -1,41 +1,37 @@
-# DRef Equivalence Testing
+# DOCK6.14 Dynamic Referencing Equivalence Testing
 
-This workflow tests whether isolating Dynamic Referencing (DRef) from `DN_Build` into a dedicated `Dynamic_Reference` manager changes the behavior of DOCK6.9 De Novo molecular generation.
+This workflow evaluates whether the isolated Dynamic Referencing implementation reproduces the molecular results of the inherited implementation in DOCK6.14.
 
-The inherited and isolated implementations are run using identical receptor files, starting anchor, fragment libraries, scoring parameters, and De Novo settings. The resulting molecular structures and growth outputs are then compared to determine behavioral equivalence.
+## Configuration
 
-The initial test uses the `1EQH` receptor system and anchor 1. Calculations are run on the `rn-long-40core` partition.
+Edit `000.config.sh` to configure the number of anchors and SLURM resources.
+
+Specify the receptor systems in `LISTOFSYSTEMS.txt`, one system per line.
 
 ## Workflow
 
-Run the scripts in the following order.
-
-### 1. Check configuration
-
-```bash
-bash 000.config.sh
-```
-
-### 2. Set up the test
+Generate identical inputs for inherited and isolated calculations:
 
 ```bash
 bash 001.setup_test.sh
 ```
 
-### 3. Run the calculations
+Submit two independent SLURM jobs on `rn-long-40core`:
 
 ```bash
-bash 002.run_test.sh
+bash 002.submit_jobs.sh
 ```
 
-### 4. Compare the results
+After both jobs finish, compare their results:
 
 ```bash
 python3 003.compare_results.py
 ```
 
-The comparison report is written to:
+## Results
 
-```text
-comparison_results/equivalence_report.txt
-```
+The calculations are organized under `runs/inherited/` and `runs/isolated/` by system and anchor.
+
+The analysis compares molecular structures, coordinates, scores, growth-layer populations, and growth trees.
+
+Reports are saved under `comparison_results/`.
