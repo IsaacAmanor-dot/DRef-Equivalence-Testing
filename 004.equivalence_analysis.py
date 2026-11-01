@@ -11,13 +11,28 @@ import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parent
 
-INHERITED = ROOT / "inherited" / "system"
-ISOLATED = ROOT / "isolated" / "system"
+BASELINE = ROOT / "baseline" / "system"
+MODULARIZED = ROOT / "modularized" / "system"
 RESULTS = ROOT / "comparison_results"
 
 STATISTICS = RESULTS / "equivalence_statistics.csv"
 
-FINAL_MOL2 = "output.denovo_build.mol2"
+def input_output_prefix():
+    input_path = ROOT / "dn_generic.in"
+    if not input_path.is_file():
+        raise SystemExit(f"ERROR: Missing canonical input: {input_path}")
+    values = []
+    for line in input_path.read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == "dn_output_prefix":
+            values.append(fields[1])
+    if len(values) != 1:
+        raise SystemExit("ERROR: Expected one dn_output_prefix in dn_generic.in")
+    return values[0]
+
+
+OUTPUT_PREFIX = input_output_prefix()
+FINAL_MOL2 = f"{OUTPUT_PREFIX}.completed.denovo_build.mol2"
 
 
 def split_mol2(path):
@@ -112,26 +127,26 @@ def parse_atoms(block):
 
 def discover_layers(directory):
     pattern = re.compile(
-        r"output\.anchor_\d+\.root_layer_(\d+)\.mol2$"
+        rf"{re.escape(OUTPUT_PREFIX)}\.anchor_\d+\.root_layer_(\d+)\.mol2$"
     )
 
     layers = {}
 
-    for path in directory.glob("output.anchor_*.root_layer_*.mol2"):
+    for path in directory.glob(f"{OUTPUT_PREFIX}.anchor_*.root_layer_*.mol2"):
         match = pattern.match(path.name)
 
         if match:
-            layers[int(match.group(1))] = path
+            layers.setdefault(int(match.group(1)), []).append(path)
 
     return layers
 
 
 def discover_growth_trees(directory):
-    pattern = re.compile(r"output\.growth_tree_(\d+)\.mol2$")
+    pattern = re.compile(rf"{re.escape(OUTPUT_PREFIX)}\.growth_tree_(\d+)\.mol2$")
 
     trees = {}
 
-    for path in directory.glob("output.growth_tree_*.mol2"):
+    for path in directory.glob(f"{OUTPUT_PREFIX}.growth_tree_*.mol2"):
         match = pattern.match(path.name)
 
         if match:
@@ -141,97 +156,71 @@ def discover_growth_trees(directory):
 
 
 def layer_statistics():
-    inherited_layers = discover_layers(INHERITED)
-    isolated_layers = discover_layers(ISOLATED)
-
-    all_layers = sorted(
-        set(inherited_layers) | set(isolated_layers)
-    )
-
+    baseline_layers = discover_layers(BASELINE)
+    modularized_layers = discover_layers(MODULARIZED)
     rows = []
 
-    for layer in all_layers:
-        inherited_file = inherited_layers.get(layer)
-        isolated_file = isolated_layers.get(layer)
+    for layer in sorted(set(baseline_layers) | set(modularized_layers)):
+        baseline_count = sum(molecule_count(path) for path in baseline_layers.get(layer, []))
+        modularized_count = sum(molecule_count(path) for path in modularized_layers.get(layer, []))
 
-        inherited_count = (
-            molecule_count(inherited_file)
-            if inherited_file
-            else 0
-        )
-
-        isolated_count = (
-            molecule_count(isolated_file)
-            if isolated_file
-            else 0
-        )
-
-        rows.append(
-            {
-                "layer": layer,
-                "inherited": inherited_count,
-                "isolated": isolated_count,
-                "difference": isolated_count - inherited_count,
-            }
-        )
+        rows.append({
+            "layer": layer,
+            "baseline": baseline_count,
+            "modularized": modularized_count,
+            "difference": modularized_count - baseline_count,
+        })
 
     return rows
 
 
 def growth_tree_statistics():
-    inherited_trees = discover_growth_trees(INHERITED)
-    isolated_trees = discover_growth_trees(ISOLATED)
-
-    common_ids = sorted(
-        set(inherited_trees) & set(isolated_trees)
-    )
-
+    baseline_trees = discover_growth_trees(BASELINE)
+    modularized_trees = discover_growth_trees(MODULARIZED)
     rows = []
 
-    for tree_id in common_ids:
-        inherited_count = molecule_count(
-            inherited_trees[tree_id]
-        )
+    for tree_id in sorted(set(baseline_trees) | set(modularized_trees)):
+        baseline_count = molecule_count(baseline_trees[tree_id]) if tree_id in baseline_trees else 0
+        modularized_count = molecule_count(modularized_trees[tree_id]) if tree_id in modularized_trees else 0
 
-        isolated_count = molecule_count(
-            isolated_trees[tree_id]
-        )
-
-        rows.append(
-            {
-                "tree": tree_id,
-                "inherited": inherited_count,
-                "isolated": isolated_count,
-                "difference": isolated_count - inherited_count,
-            }
-        )
+        rows.append({
+            "tree": tree_id,
+            "baseline": baseline_count,
+            "modularized": modularized_count,
+            "difference": modularized_count - baseline_count,
+        })
 
     return rows
 
 
 def coordinate_statistics():
-    inherited_file = INHERITED / FINAL_MOL2
-    isolated_file = ISOLATED / FINAL_MOL2
+    baseline_file = BASELINE / FINAL_MOL2
+    modularized_file = MODULARIZED / FINAL_MOL2
 
-    inherited_molecules = split_mol2(inherited_file)
-    isolated_molecules = split_mol2(isolated_file)
+    baseline_molecules = split_mol2(baseline_file)
+    modularized_molecules = split_mol2(modularized_file)
+
+    if len(baseline_molecules) != len(modularized_molecules):
+        raise ValueError("Final molecule counts differ; coordinate analysis is not aligned.")
 
     squared = []
     distances = []
 
-    for inherited_mol, isolated_mol in zip(
-        inherited_molecules,
-        isolated_molecules,
+    for baseline_mol, modularized_mol in zip(
+        baseline_molecules,
+        modularized_molecules,
     ):
-        inherited_atoms = parse_atoms(inherited_mol)
-        isolated_atoms = parse_atoms(isolated_mol)
+        baseline_atoms = parse_atoms(baseline_mol)
+        modularized_atoms = parse_atoms(modularized_mol)
 
+        if len(baseline_atoms) != len(modularized_atoms):
+            raise ValueError("Final molecule atom counts differ; coordinate analysis is not aligned.")
         for atom_a, atom_b in zip(
-            inherited_atoms,
-            isolated_atoms,
+            baseline_atoms,
+            modularized_atoms,
         ):
             if atom_a[0] != atom_b[0]:
-                continue
+                raise ValueError("Final molecule atom IDs differ; coordinate analysis is not aligned.")
 
             dx = atom_b[1] - atom_a[1]
             dy = atom_b[2] - atom_a[2]
@@ -259,20 +248,23 @@ def coordinate_statistics():
 
 
 def common_numeric_properties():
-    inherited_file = INHERITED / FINAL_MOL2
-    isolated_file = ISOLATED / FINAL_MOL2
+    baseline_file = BASELINE / FINAL_MOL2
+    modularized_file = MODULARIZED / FINAL_MOL2
 
-    inherited_molecules = split_mol2(inherited_file)
-    isolated_molecules = split_mol2(isolated_file)
+    baseline_molecules = split_mol2(baseline_file)
+    modularized_molecules = split_mol2(modularized_file)
+
+    if len(baseline_molecules) != len(modularized_molecules):
+        raise ValueError("Final molecule counts differ; score analysis is not aligned.")
 
     property_pairs = {}
 
-    for inherited_mol, isolated_mol in zip(
-        inherited_molecules,
-        isolated_molecules,
+    for baseline_mol, modularized_mol in zip(
+        baseline_molecules,
+        modularized_molecules,
     ):
-        props_a = parse_properties(inherited_mol)
-        props_b = parse_properties(isolated_mol)
+        props_a = parse_properties(baseline_mol)
+        props_b = parse_properties(modularized_mol)
 
         for key in sorted(set(props_a) & set(props_b)):
             values_a = props_a[key]
@@ -356,8 +348,8 @@ def score_statistics(values):
         }
 
     differences = [
-        isolated - inherited
-        for inherited, isolated in values
+        modularized - baseline
+        for baseline, modularized in values
     ]
 
     absolute = [abs(value) for value in differences]
@@ -396,17 +388,17 @@ def save_statistics(
         default=0,
     )
 
-    final_inherited = molecule_count(
-        INHERITED / FINAL_MOL2
+    final_baseline = molecule_count(
+        BASELINE / FINAL_MOL2
     )
 
-    final_isolated = molecule_count(
-        ISOLATED / FINAL_MOL2
+    final_modularized = molecule_count(
+        MODULARIZED / FINAL_MOL2
     )
 
     rows = [
-        ("final_molecules_inherited", final_inherited),
-        ("final_molecules_isolated", final_isolated),
+        ("final_molecules_baseline", final_baseline),
+        ("final_molecules_modularized", final_modularized),
         ("growth_layers_compared", len(layer_rows)),
         ("max_growth_layer_population_difference",
          max_layer_difference),
@@ -436,26 +428,26 @@ def save_statistics(
 
 def plot_growth_layers(rows):
     layers = [row["layer"] for row in rows]
-    inherited = [row["inherited"] for row in rows]
-    isolated = [row["isolated"] for row in rows]
+    baseline = [row["baseline"] for row in rows]
+    modularized = [row["modularized"] for row in rows]
 
     plt.figure(figsize=(8, 5))
 
     plt.plot(
         layers,
-        inherited,
+        baseline,
         marker="o",
         linewidth=2,
-        label="Inherited DRef",
+        label="Baseline DRef",
     )
 
     plt.plot(
         layers,
-        isolated,
+        modularized,
         marker="x",
         linestyle="--",
         linewidth=1.5,
-        label="Isolated DRef",
+        label="Modularized DRef",
     )
 
     plt.xlabel("Growth Layer")
@@ -474,21 +466,21 @@ def plot_growth_layers(rows):
 
 
 def plot_growth_tree_identity(rows):
-    inherited = [row["inherited"] for row in rows]
-    isolated = [row["isolated"] for row in rows]
+    baseline = [row["baseline"] for row in rows]
+    modularized = [row["modularized"] for row in rows]
 
     plt.figure(figsize=(6, 6))
 
     plt.scatter(
-        inherited,
-        isolated,
+        baseline,
+        modularized,
         s=28,
         alpha=0.65,
     )
 
-    if inherited and isolated:
-        minimum = min(inherited + isolated)
-        maximum = max(inherited + isolated)
+    if baseline and modularized:
+        minimum = min(baseline + modularized)
+        maximum = max(baseline + modularized)
 
         plt.plot(
             [minimum, maximum],
@@ -498,8 +490,8 @@ def plot_growth_tree_identity(rows):
             label="Identity line",
         )
 
-    plt.xlabel("Inherited Growth-Tree Size")
-    plt.ylabel("Isolated Growth-Tree Size")
+    plt.xlabel("Baseline Growth-Tree Size")
+    plt.ylabel("Modularized Growth-Tree Size")
     plt.title("Growth-Tree Identity")
     plt.legend()
     plt.tight_layout()
@@ -513,20 +505,20 @@ def plot_growth_tree_identity(rows):
 
 
 def plot_growth_tree_distribution(rows):
-    inherited = [row["inherited"] for row in rows]
-    isolated = [row["isolated"] for row in rows]
+    baseline = [row["baseline"] for row in rows]
+    modularized = [row["modularized"] for row in rows]
 
     unique_sizes = sorted(
-        set(inherited) | set(isolated)
+        set(baseline) | set(modularized)
     )
 
-    inherited_frequency = [
-        inherited.count(size)
+    baseline_frequency = [
+        baseline.count(size)
         for size in unique_sizes
     ]
 
-    isolated_frequency = [
-        isolated.count(size)
+    modularized_frequency = [
+        modularized.count(size)
         for size in unique_sizes
     ]
 
@@ -537,16 +529,16 @@ def plot_growth_tree_distribution(rows):
 
     plt.bar(
         [position - width / 2 for position in positions],
-        inherited_frequency,
+        baseline_frequency,
         width=width,
-        label="Inherited DRef",
+        label="Baseline DRef",
     )
 
     plt.bar(
         [position + width / 2 for position in positions],
-        isolated_frequency,
+        modularized_frequency,
         width=width,
-        label="Isolated DRef",
+        label="Modularized DRef",
     )
 
     plt.xlabel("Growth-Tree Size")
@@ -565,21 +557,21 @@ def plot_growth_tree_distribution(rows):
 
 
 def plot_score_identity(score_key, values):
-    inherited = [value[0] for value in values]
-    isolated = [value[1] for value in values]
+    baseline = [value[0] for value in values]
+    modularized = [value[1] for value in values]
 
     plt.figure(figsize=(6, 6))
 
     plt.scatter(
-        inherited,
-        isolated,
+        baseline,
+        modularized,
         s=25,
         alpha=0.65,
     )
 
-    if inherited and isolated:
-        minimum = min(inherited + isolated)
-        maximum = max(inherited + isolated)
+    if baseline and modularized:
+        minimum = min(baseline + modularized)
+        maximum = max(baseline + modularized)
 
         plt.plot(
             [minimum, maximum],
@@ -589,8 +581,8 @@ def plot_score_identity(score_key, values):
             label="Identity line",
         )
 
-    plt.xlabel(f"Inherited {score_key}")
-    plt.ylabel(f"Isolated {score_key}")
+    plt.xlabel(f"Baseline {score_key}")
+    plt.ylabel(f"Modularized {score_key}")
     plt.title("Score Identity")
     plt.legend()
     plt.tight_layout()
@@ -605,8 +597,8 @@ def plot_score_identity(score_key, values):
 
 def plot_score_difference(score_key, values):
     differences = [
-        isolated - inherited
-        for inherited, isolated in values
+        modularized - baseline
+        for baseline, modularized in values
     ]
 
     molecule_ids = list(range(1, len(differences) + 1))
@@ -627,7 +619,7 @@ def plot_score_difference(score_key, values):
     )
 
     plt.xlabel("Score Observation")
-    plt.ylabel("Isolated - Inherited")
+    plt.ylabel("Modularized - Baseline")
     plt.title(f"{score_key} Difference")
     plt.tight_layout()
 
@@ -642,19 +634,19 @@ def plot_score_difference(score_key, values):
 def main():
     RESULTS.mkdir(parents=True, exist_ok=True)
 
-    final_inherited = INHERITED / FINAL_MOL2
-    final_isolated = ISOLATED / FINAL_MOL2
+    final_baseline = BASELINE / FINAL_MOL2
+    final_modularized = MODULARIZED / FINAL_MOL2
 
-    if not final_inherited.exists():
+    if not final_baseline.exists():
         print(
-            f"ERROR: Missing inherited {FINAL_MOL2}",
+            f"ERROR: Missing baseline {FINAL_MOL2}",
             file=sys.stderr,
         )
         return 1
 
-    if not final_isolated.exists():
+    if not final_modularized.exists():
         print(
-            f"ERROR: Missing isolated {FINAL_MOL2}",
+            f"ERROR: Missing modularized {FINAL_MOL2}",
             file=sys.stderr,
         )
         return 1

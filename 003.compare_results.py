@@ -10,8 +10,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parent
 
-INHERITED = ROOT / "inherited" / "system"
-ISOLATED = ROOT / "isolated" / "system"
+BASELINE = ROOT / "baseline" / "system"
+MODULARIZED = ROOT / "modularized" / "system"
 RESULTS = ROOT / "comparison_results"
 
 REPORT = RESULTS / "equivalence_report.txt"
@@ -20,7 +20,22 @@ COORD_TOL = 1.0e-6
 CHARGE_TOL = 1.0e-6
 NUMERIC_TOL = 1.0e-6
 
-FINAL_MOL2 = "output.denovo_build.mol2"
+def input_output_prefix():
+    input_path = ROOT / "dn_generic.in"
+    if not input_path.is_file():
+        raise SystemExit(f"ERROR: Missing canonical input: {input_path}")
+    values = []
+    for line in input_path.read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == "dn_output_prefix":
+            values.append(fields[1])
+    if len(values) != 1:
+        raise SystemExit("ERROR: Expected one dn_output_prefix in dn_generic.in")
+    return values[0]
+
+
+OUTPUT_PREFIX = input_output_prefix()
+FINAL_MOL2 = f"{OUTPUT_PREFIX}.completed.denovo_build.mol2"
 
 
 def sha256(path):
@@ -299,7 +314,7 @@ def compare_mol2(path_a, path_b):
 def generated_mol2_files(directory):
     return {
         path.name: path
-        for path in directory.glob("output*.mol2")
+        for path in directory.glob("*.mol2")
         if path.is_file()
     }
 
@@ -319,32 +334,35 @@ def main():
 
     with REPORT.open("w") as report:
 
-        write("DRef Equivalence Test", report)
+        write("DOCK6.14 DRef Equivalence Test", report)
+        write(f"Baseline directory: {BASELINE}", report)
+        write(f"Modularized directory: {MODULARIZED}", report)
+        write(f"MOL2 output prefix: {OUTPUT_PREFIX}", report)
         write("", report)
 
-        inherited_success = (INHERITED / ".success").exists()
-        isolated_success = (ISOLATED / ".success").exists()
+        baseline_success = (BASELINE / ".success").exists()
+        modularized_success = (MODULARIZED / ".success").exists()
 
         write(
-            f"Inherited execution: "
-            f"{'PASS' if inherited_success else 'FAIL'}",
+            f"Baseline execution: "
+            f"{'PASS' if baseline_success else 'FAIL'}",
             report,
         )
 
         write(
-            f"Isolated execution:  "
-            f"{'PASS' if isolated_success else 'FAIL'}",
+            f"Modularized execution:  "
+            f"{'PASS' if modularized_success else 'FAIL'}",
             report,
         )
 
-        if not inherited_success:
-            failures.append("Inherited calculation did not complete.")
+        if not baseline_success:
+            failures.append("Baseline calculation did not complete.")
 
-        if not isolated_success:
-            failures.append("Isolated calculation did not complete.")
+        if not modularized_success:
+            failures.append("Modularized calculation did not complete.")
 
-        input_a = INHERITED / "dn_generic.in"
-        input_b = ISOLATED / "dn_generic.in"
+        input_a = BASELINE / "dn_generic.in"
+        input_b = MODULARIZED / "dn_generic.in"
 
         if input_a.exists() and input_b.exists():
 
@@ -359,47 +377,49 @@ def main():
                 f"{'PASS' if input_equal else 'FAIL'}",
                 report,
             )
-            write(f"Inherited SHA256:   {hash_a}", report)
-            write(f"Isolated SHA256:    {hash_b}", report)
+            write(f"Baseline SHA256:   {hash_a}", report)
+            write(f"Modularized SHA256:    {hash_b}", report)
 
             if not input_equal:
                 failures.append(
-                    "Inherited and isolated input files differ."
+                    "Baseline and modularized input files differ."
                 )
 
         else:
             failures.append("One or both input files are missing.")
 
-        inherited_files = generated_mol2_files(INHERITED)
-        isolated_files = generated_mol2_files(ISOLATED)
+        baseline_files = generated_mol2_files(BASELINE)
+        modularized_files = generated_mol2_files(MODULARIZED)
 
-        names_a = set(inherited_files)
-        names_b = set(isolated_files)
+        names_a = set(baseline_files)
+        names_b = set(modularized_files)
 
         write("", report)
         write(
             f"Generated MOL2 files: "
-            f"{len(names_a)} inherited, "
-            f"{len(names_b)} isolated",
+            f"{len(names_a)} baseline, "
+            f"{len(names_b)} modularized",
             report,
         )
 
-        missing_isolated = sorted(names_a - names_b)
-        missing_inherited = sorted(names_b - names_a)
+        missing_modularized = sorted(names_a - names_b)
+        missing_baseline = sorted(names_b - names_a)
 
-        if missing_isolated:
+        if missing_modularized:
             failures.append(
-                "Missing from isolated: "
-                + ", ".join(missing_isolated)
+                "Missing from modularized: "
+                + ", ".join(missing_modularized)
             )
 
-        if missing_inherited:
+        if missing_baseline:
             failures.append(
-                "Missing from inherited: "
-                + ", ".join(missing_inherited)
+                "Missing from baseline: "
+                + ", ".join(missing_baseline)
             )
 
         common_files = sorted(names_a & names_b)
+        if not common_files:
+            failures.append("No common MOL2 files were found in the run directories.")
 
         structural_failures = 0
         exact_matches = 0
@@ -409,8 +429,8 @@ def main():
 
         for name in common_files:
 
-            path_a = inherited_files[name]
-            path_b = isolated_files[name]
+            path_a = baseline_files[name]
+            path_b = modularized_files[name]
 
             exact = sha256(path_a) == sha256(path_b)
 
@@ -448,17 +468,17 @@ def main():
                         report,
                     )
 
-        final_a = INHERITED / FINAL_MOL2
-        final_b = ISOLATED / FINAL_MOL2
+        final_a = BASELINE / FINAL_MOL2
+        final_b = MODULARIZED / FINAL_MOL2
 
         if not final_a.exists():
             failures.append(
-                f"Inherited final MOL2 missing: {FINAL_MOL2}"
+                f"Baseline final MOL2 missing: {FINAL_MOL2}"
             )
 
         if not final_b.exists():
             failures.append(
-                f"Isolated final MOL2 missing: {FINAL_MOL2}"
+                f"Modularized final MOL2 missing: {FINAL_MOL2}"
             )
 
         if structural_failures:
@@ -510,8 +530,8 @@ def main():
         else:
             write("OVERALL RESULT: PASS", report)
             write(
-                "The isolated implementation is structurally "
-                "equivalent to the inherited implementation "
+                "The modularized implementation is structurally "
+                "equivalent to the baseline implementation "
                 "for this test case.",
                 report,
             )
