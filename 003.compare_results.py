@@ -265,6 +265,392 @@ def compare_pair(system, anchor):
     return [system, anchor, result, na, nb, bad, len(ta), len(tb), differing_trees, rmsd, '; '.join(errors)]
 
 
+
+def generate_analysis_plots():
+    import csv
+    from collections import Counter, defaultdict
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    plt.rcParams.update({"font.size": 11})
+
+    def read_prefix(directory):
+        values = []
+        for line in (directory / "dn_generic.in").read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "dn_output_prefix":
+                values.append(parts[1])
+        if len(values) != 1:
+            raise ValueError(f"Invalid dn_output_prefix: {directory}")
+        return values[0]
+
+    def count_molecules(path):
+        with path.open("rb") as handle:
+            return sum(
+                line.startswith(b"@<TRIPOS>MOLECULE")
+                for line in handle
+            )
+
+    def read_final(path):
+        sizes = []
+        scores = defaultdict(list)
+        in_atoms = False
+        heavy_atoms = 0
+
+        with path.open(errors="replace") as handle:
+            for line in handle:
+                if line.startswith("@<TRIPOS>MOLECULE"):
+                    if heavy_atoms or in_atoms:
+                        sizes.append(heavy_atoms)
+                    heavy_atoms = 0
+                    in_atoms = False
+
+                elif line.startswith("@<TRIPOS>ATOM"):
+                    in_atoms = True
+
+                elif line.startswith("@<TRIPOS>"):
+                    in_atoms = False
+
+                elif in_atoms:
+                    fields = line.split()
+                    if len(fields) >= 6:
+                        atom_type = fields[5].split(".")[0].upper()
+                        if atom_type not in ("H", "D"):
+                            heavy_atoms += 1
+
+                elif line.lstrip().startswith("##########") and ":" in line:
+                    key, value = line.strip().lstrip("#").strip().split(":", 1)
+                    key = key.strip()
+                    if "score" not in key.lower():
+                        continue
+                    try:
+                        number = float(value.strip())
+                        if math.isfinite(number):
+                            scores[key].append(number)
+                    except ValueError:
+                        pass
+
+        if heavy_atoms or in_atoms:
+            sizes.append(heavy_atoms)
+
+        return sizes, dict(scores)
+
+    def save(fig, path):
+        fig.tight_layout()
+        fig.savefig(path, dpi=300)
+        plt.close(fig)
+
+    def paired_bars(path, labels, inherited, isolated,
+                    title, ylabel):
+        x = np.arange(len(labels))
+        fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.1), 5))
+        ax.bar(x - 0.2, inherited, 0.4, label="Inherited DRef")
+        ax.bar(x + 0.2, isolated, 0.4, label="Isolated DRef")
+        ax.set_xticks(x, labels)
+        ax.set_xlabel("Anchor")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend()
+        save(fig, path)
+
+    def distribution(path, inherited, isolated, title, xlabel,
+                     discrete=False):
+        if not inherited and not isolated:
+            return
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        if discrete:
+            ca = Counter(inherited)
+            cb = Counter(isolated)
+            values = sorted(set(ca) | set(cb))
+            x = np.arange(len(values))
+            ax.bar(x - 0.2, [ca[v] for v in values], 0.4,
+                   label="Inherited DRef")
+            ax.bar(x + 0.2, [cb[v] for v in values], 0.4,
+                   label="Isolated DRef")
+            if len(values) <= 30:
+                ax.set_xticks(x, values)
+            else:
+                selected = np.linspace(0, len(values) - 1, 12, dtype=int)
+                ax.set_xticks(selected, [values[i] for i in selected])
+        else:
+            data = inherited + isolated
+            lo, hi = min(data), max(data)
+            bins = np.linspace(lo, hi, 51) if lo < hi else 1
+            ax.hist(inherited, bins=bins, histtype="step",
+                    linewidth=2, label="Inherited DRef")
+            ax.hist(isolated, bins=bins, histtype="step",
+                    linewidth=2, linestyle="--",
+                    label="Isolated DRef")
+
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Frequency")
+        ax.legend()
+        save(fig, path)
+
+    def plot_difference(path, inherited, isolated, title):
+        if not inherited or len(inherited) != len(isolated):
+            return
+
+        delta = np.asarray(isolated) - np.asarray(inherited)
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.scatter(np.arange(1, len(delta) + 1), delta,
+                   s=5, alpha=0.5)
+        ax.axhline(0, linestyle="--", color="black")
+        ax.set_xlabel("Molecule index")
+        ax.set_ylabel("Isolated - Inherited")
+        ax.set_title(title)
+        save(fig, path)
+
+    tasks = defaultdict(list)
+
+    for line in (RUNS / "tasks.tsv").read_text().splitlines():
+        if line.strip():
+            system, anchor = line.split()
+            tasks[system].append(anchor)
+
+    for system, anchors in tasks.items():
+        system_out = RESULTS / system
+        system_out.mkdir(parents=True, exist_ok=True)
+
+        anchor_rows = []
+        score_rows = []
+        pooled_sizes = {"inherited": [], "isolated": []}
+        pooled_trees = {"inherited": [], "isolated": []}
+        pooled_scores = {
+            "inherited": defaultdict(list),
+            "isolated": defaultdict(list)
+        }
+
+        for anchor in anchors:
+            pair_out = system_out / f"anc_{anchor}"
+            pair_out.mkdir(parents=True, exist_ok=True)
+
+            molecular_sizes = {}
+            score_values = {}
+            tree_sizes = {}
+            tree_counts = {}
+            tree_records = {}
+            layer_counts = {}
+
+            for mode in ("inherited", "isolated"):
+                directory = RUNS / mode / system / f"anc_{anchor}"
+                prefix = read_prefix(directory)
+                final = directory / f"{prefix}.completed.denovo_build.mol2"
+
+                if not final.is_file():
+                    print(f"WARNING: Missing {final}", flush=True)
+                    molecular_sizes[mode] = []
+                    score_values[mode] = {}
+                else:
+                    molecular_sizes[mode], score_values[mode] = read_final(final)
+
+                trees = sorted(
+                    directory.glob(f"{prefix}.growth_tree_*.mol2")
+                )
+                tree_sizes[mode] = [count_molecules(p) for p in trees]
+                tree_counts[mode] = len(trees)
+                tree_records[mode] = sum(tree_sizes[mode])
+
+                layers = defaultdict(int)
+                for p in directory.glob(f"{prefix}.*root_layer_*.mol2"):
+                    match = re.search(r"root_layer_(\\d+)\\.mol2$", p.name)
+                    if match:
+                        layers[int(match.group(1))] += count_molecules(p)
+                layer_counts[mode] = dict(layers)
+
+                pooled_sizes[mode].extend(molecular_sizes[mode])
+                pooled_trees[mode].extend(tree_sizes[mode])
+                for key, values in score_values[mode].items():
+                    pooled_scores[mode][key].extend(values)
+
+            anchor_rows.append({
+                "anchor": anchor,
+                "inherited_final": len(molecular_sizes["inherited"]),
+                "isolated_final": len(molecular_sizes["isolated"]),
+                "inherited_trees": tree_counts["inherited"],
+                "isolated_trees": tree_counts["isolated"],
+                "inherited_tree_records": tree_records["inherited"],
+                "isolated_tree_records": tree_records["isolated"]
+            })
+
+            distribution(
+                pair_out / "final_molecule_size_histogram.png",
+                molecular_sizes["inherited"],
+                molecular_sizes["isolated"],
+                f"{system} Anchor {anchor}: Final Molecule Sizes",
+                "Number of heavy atoms",
+                discrete=True
+            )
+
+            distribution(
+                pair_out / "growth_tree_size_distribution.png",
+                tree_sizes["inherited"],
+                tree_sizes["isolated"],
+                f"{system} Anchor {anchor}: Growth-Tree Size Distribution",
+                "Molecule records per growth tree",
+                discrete=True
+            )
+
+            fig, ax = plt.subplots(figsize=(7, 5))
+            labels = ["Inherited", "Isolated"]
+            counts = [
+                len(molecular_sizes["inherited"]),
+                len(molecular_sizes["isolated"])
+            ]
+            ax.bar(labels, counts)
+            ax.set_ylabel("Number of final molecules")
+            ax.set_title(f"{system} Anchor {anchor}: Final Molecule Counts")
+            save(fig, pair_out / "final_molecule_counts.png")
+
+            all_layers = sorted(
+                set(layer_counts["inherited"]) |
+                set(layer_counts["isolated"])
+            )
+            if all_layers:
+                fig, ax = plt.subplots(figsize=(9, 5))
+                for mode, marker in (("inherited", "o"), ("isolated", "x")):
+                    values = [layer_counts[mode].get(i, 0) for i in all_layers]
+                    ax.plot(all_layers, values, marker=marker,
+                            label=f"{mode.capitalize()} DRef")
+                ax.set_xlabel("Growth layer")
+                ax.set_ylabel("Molecule records")
+                ax.set_title(f"{system} Anchor {anchor}: Growth-Layer Population")
+                ax.legend()
+                save(fig, pair_out / "growth_layer_population_line.png")
+
+            common_scores = sorted(
+                set(score_values["inherited"]) &
+                set(score_values["isolated"])
+            )
+
+            for key in common_scores:
+                inherited = score_values["inherited"][key]
+                isolated = score_values["isolated"][key]
+                if not inherited or not isolated:
+                    continue
+
+                safe = re.sub(r"[^A-Za-z0-9_-]+", "_", key)
+
+                distribution(
+                    pair_out / f"score_histogram_{safe}.png",
+                    inherited, isolated,
+                    f"{system} Anchor {anchor}: {key} Distribution",
+                    key
+                )
+
+                plot_difference(
+                    pair_out / f"score_difference_{safe}.png",
+                    inherited, isolated,
+                    f"{system} Anchor {anchor}: {key} Differences"
+                )
+
+                if len(inherited) == len(isolated):
+                    delta = np.asarray(isolated) - np.asarray(inherited)
+                    mae = float(np.mean(np.abs(delta)))
+                    rmse = float(np.sqrt(np.mean(delta ** 2)))
+                    max_diff = float(np.max(np.abs(delta)))
+                else:
+                    mae = rmse = max_diff = math.nan
+
+                score_rows.append({
+                    "system": system, "anchor": anchor,
+                    "score": key,
+                    "inherited_n": len(inherited),
+                    "isolated_n": len(isolated),
+                    "inherited_mean": float(np.mean(inherited)),
+                    "isolated_mean": float(np.mean(isolated)),
+                    "mae": mae,
+                    "rmse": rmse,
+                    "max_abs_difference": max_diff
+                })
+
+        if not anchor_rows:
+            continue
+
+        with (system_out / "cross_anchor_molecule_statistics.csv").open(
+            "w", newline=""
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=anchor_rows[0])
+            writer.writeheader()
+            writer.writerows(anchor_rows)
+
+        if score_rows:
+            with (system_out / "cross_anchor_score_statistics.csv").open(
+                "w", newline=""
+            ) as handle:
+                writer = csv.DictWriter(handle, fieldnames=score_rows[0])
+                writer.writeheader()
+                writer.writerows(score_rows)
+
+        anchor_labels = [r["anchor"] for r in anchor_rows]
+
+        for name, col_a, col_b, ylabel, title in (
+            ("final_molecule_counts.png", "inherited_final",
+             "isolated_final", "Number of final molecules",
+             "Final Molecules Across Anchors"),
+            ("growth_tree_counts.png", "inherited_trees",
+             "isolated_trees", "Number of growth trees",
+             "Growth Trees Across Anchors"),
+            ("growth_tree_total_molecule_records.png",
+             "inherited_tree_records", "isolated_tree_records",
+             "Molecule records", "Growth-Tree Records Across Anchors")
+        ):
+            paired_bars(
+                system_out / name, anchor_labels,
+                [r[col_a] for r in anchor_rows],
+                [r[col_b] for r in anchor_rows],
+                f"{system}: {title}", ylabel
+            )
+
+        distribution(
+            system_out / "cross_anchor_molecule_size_distribution.png",
+            pooled_sizes["inherited"],
+            pooled_sizes["isolated"],
+            f"{system}: Pooled Final Molecule Sizes",
+            "Number of heavy atoms", discrete=True
+        )
+
+        distribution(
+            system_out / "cross_anchor_growth_tree_size_distribution.png",
+            pooled_trees["inherited"],
+            pooled_trees["isolated"],
+            f"{system}: Pooled Growth-Tree Size Distribution",
+            "Molecule records per growth tree", discrete=True
+        )
+
+        for key in sorted(
+            set(pooled_scores["inherited"]) &
+            set(pooled_scores["isolated"])
+        ):
+            safe = re.sub(r"[^A-Za-z0-9_-]+", "_", key)
+            distribution(
+                system_out / f"cross_anchor_score_histogram_{safe}.png",
+                pooled_scores["inherited"][key],
+                pooled_scores["isolated"][key],
+                f"{system}: Pooled {key} Distribution",
+                key
+            )
+
+            observations = [r for r in score_rows if r["score"] == key]
+            if observations:
+                paired_bars(
+                    system_out / f"cross_anchor_score_mean_{safe}.png",
+                    [r["anchor"] for r in observations],
+                    [r["inherited_mean"] for r in observations],
+                    [r["isolated_mean"] for r in observations],
+                    f"{system}: Mean {key} Across Anchors",
+                    f"Mean {key}"
+                )
+
+        print(f"Analysis plots: {system_out}", flush=True)
+
+
 def main():
     tasks = RUNS / 'tasks.tsv'
     if not tasks.is_file():
@@ -290,6 +676,7 @@ def main():
                          'final_molecule_mismatches', 'inherited_growth_trees', 'isolated_growth_trees',
                          'growth_tree_mismatches', 'coordinate_rmsd_A', 'details'])
         writer.writerows(rows)
+    generate_analysis_plots()
     print('Summary:', RESULTS / 'equivalence_summary.csv')
     return int(not rows or any(row[2] != 'PASS' for row in rows))
 
