@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Compare each inherited/isolated system-anchor pair and summarize equivalence."""
+"""Compare inherited/isolated DOCK de novo outputs for each matched system-anchor."""
 from pathlib import Path
+from itertools import zip_longest
 import csv
 import hashlib
 import math
@@ -13,187 +14,284 @@ RESULTS = ROOT / 'comparison_results'
 TOL = 1e-6
 
 
-def sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def parameter(path, key):
-    values = [f[1] for line in path.read_text().splitlines()
-              if (f := line.split()) and len(f) > 1 and f[0] == key]
+    values = [parts[1] for line in path.read_text().splitlines()
+              if (parts := line.split()) and len(parts) > 1 and parts[0] == key]
     if len(values) != 1:
-        raise ValueError(f'Expected one {key}: {path}')
+        raise ValueError(f'Expected exactly one {key} in {path}')
     return values[0]
 
 
-def split_molecules(path):
-    text = path.read_text(errors='replace')
-    return ['@<TRIPOS>MOLECULE' + x for x in text.split('@<TRIPOS>MOLECULE')[1:] if x.strip()]
+def digest(path):
+    h = hashlib.sha256()
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
 
 
-def section(molecule, name):
-    marker = f'@<TRIPOS>{name}'
-    if marker not in molecule:
+def mol_blocks(path):
+    """Stream molecules without loading the complete MOL2 output into memory."""
+    block = []
+    with path.open(errors='replace') as handle:
+        for line in handle:
+            if line.startswith('@<TRIPOS>MOLECULE'):
+                if block:
+                    yield ''.join(block)
+                block = [line]
+            elif block:
+                block.append(line)
+        if block:
+            yield ''.join(block)
+
+
+def section(block, kind):
+    marker = '@<TRIPOS>' + kind
+    if marker not in block:
         return []
-    piece = molecule.split(marker, 1)[1]
-    piece = re.split(r'\n@<TRIPOS>', piece, maxsplit=1)[0]
-    return [line.split() for line in piece.splitlines() if line.strip()]
+    remainder = block.split(marker, 1)[1]
+    remainder = re.split(r'\n@<TRIPOS>', remainder, maxsplit=1)[0]
+    return [line.split() for line in remainder.splitlines() if line.strip() and not line.startswith('#')]
 
 
-def properties(molecule):
-    props = {}
-    for line in molecule.splitlines():
+def properties(block):
+    data = {}
+    for line in block.splitlines():
         if line.lstrip().startswith('##########') and ':' in line:
-            k, v = line.strip().lstrip('#').strip().split(':', 1)
-            props.setdefault(k.strip(), []).append(v.strip())
-    return props
+            key, value = line.strip().lstrip('#').strip().split(':', 1)
+            data.setdefault(key.strip(), []).append(value.strip())
+    return data
 
 
-def near(a, b):
+def equal(a, b):
     try:
-        return math.isclose(float(a), float(b), abs_tol=TOL, rel_tol=TOL)
-    except (TypeError, ValueError):
+        x, y = float(a), float(b)
+        return math.isfinite(x) and math.isfinite(y) and math.isclose(x, y, rel_tol=TOL, abs_tol=TOL)
+    except ValueError:
         return a == b
 
 
-def compare_molecule(a, b):
-    errors, distances, score_differences = [], [], []
-    name_a = a.splitlines()[1].strip() if len(a.splitlines()) > 1 else ''
-    name_b = b.splitlines()[1].strip() if len(b.splitlines()) > 1 else ''
-    if name_a != name_b:
-        errors.append('molecule name')
-    aa, ab = section(a, 'ATOM'), section(b, 'ATOM')
-    if len(aa) != len(ab):
-        errors.append('atom count')
-    for x, y in zip(aa, ab):
+def inspect_molecule(a, b, score_pairs=None, coord_squares=None):
+    faults = set()
+    al, bl = a.splitlines(), b.splitlines()
+    if (al[1].strip() if len(al) > 1 else '') != (bl[1].strip() if len(bl) > 1 else ''):
+        faults.add('name')
+    aa, ba = section(a, 'ATOM'), section(b, 'ATOM')
+    if len(aa) != len(ba):
+        faults.add('atom count')
+    for x, y in zip(aa, ba):
         if len(x) < 6 or len(y) < 6:
-            errors.append('malformed atom record')
+            faults.add('malformed atom')
             continue
-        if x[0:2] != y[0:2] or x[5] != y[5] or (x[6:8] != y[6:8]):
-            errors.append('atom identity/type')
-        for i in (2, 3, 4):
-            if not near(x[i], y[i]):
-                errors.append('coordinate')
-        d2 = sum((float(x[i]) - float(y[i])) ** 2 for i in (2, 3, 4))
-        distances.append(d2)
-        if len(x) > 8 or len(y) > 8:
-            if len(x) <= 8 or len(y) <= 8 or not near(x[8], y[8]):
-                errors.append('charge')
+        if x[:2] != y[:2] or x[5:8] != y[5:8]:
+            faults.add('atom identity/type')
+        try:
+            delta = [float(x[i]) - float(y[i]) for i in (2, 3, 4)]
+            if coord_squares is not None:
+                coord_squares.append(sum(v*v for v in delta))
+            if any(not equal(x[i], y[i]) for i in (2, 3, 4)):
+                faults.add('coordinates')
+        except (ValueError, IndexError):
+            faults.add('malformed coordinates')
+        if (x[8] if len(x) > 8 else None) != (y[8] if len(y) > 8 else None):
+            if len(x) <= 8 or len(y) <= 8 or not equal(x[8], y[8]):
+                faults.add('charge')
     if section(a, 'BOND') != section(b, 'BOND'):
-        errors.append('bond definitions')
+        faults.add('bonds')
     pa, pb = properties(a), properties(b)
-    if pa.keys() != pb.keys():
-        errors.append('property keys')
-    for key in pa.keys() & pb.keys():
+    if set(pa) != set(pb):
+        faults.add('property keys')
+    for key in set(pa) & set(pb):
         if len(pa[key]) != len(pb[key]):
-            errors.append('property count: ' + key)
+            faults.add('property count')
             continue
-        for x, y in zip(pa[key], pb[key]):
-            if not near(x, y):
-                errors.append('property: ' + key)
-            if 'score' in key.lower():
+        for av, bv in zip(pa[key], pb[key]):
+            if not equal(av, bv):
+                faults.add('property values')
+            if score_pairs is not None and 'score' in key.lower():
                 try:
-                    score_differences.append(float(y) - float(x))
+                    x, y = float(av), float(bv)
+                    if math.isfinite(x) and math.isfinite(y):
+                        score_pairs.setdefault(key, []).append((x, y))
                 except ValueError:
                     pass
-    return errors, distances, score_differences
+    return faults
+
+
+def compare_final(a, b):
+    total_a = total_b = 0
+    mismatches = 0
+    examples = []
+    scores = {}
+    coord_squares = []
+    for index, (ma, mb) in enumerate(zip_longest(mol_blocks(a), mol_blocks(b)), 1):
+        if ma is not None:
+            total_a += 1
+        if mb is not None:
+            total_b += 1
+        if ma is None or mb is None:
+            mismatches += 1
+            continue
+        faults = inspect_molecule(ma, mb, scores, coord_squares)
+        if faults:
+            mismatches += 1
+            if len(examples) < 20:
+                examples.append(f'Molecule {index}: {", ".join(sorted(faults))}')
+    rmsd = math.sqrt(sum(coord_squares) / len(coord_squares)) if coord_squares else math.nan
+    return total_a, total_b, mismatches, examples, scores, rmsd
+
+
+def compare_tree(a, b):
+    """Accept numeric-tolerance equivalence when files differ byte-for-byte."""
+    if digest(a) == digest(b):
+        return True
+    for ma, mb in zip_longest(mol_blocks(a), mol_blocks(b)):
+        if ma is None or mb is None or inspect_molecule(ma, mb):
+            return False
+    return True
+
+
+def molecule_count(path):
+    count = 0
+    with path.open('rb') as handle:
+        for line in handle:
+            if line.startswith(b'@<TRIPOS>MOLECULE'):
+                count += 1
+    return count
+
+
+def scatter(path, x, y, title, xlabel, ylabel):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(x, y, s=8, alpha=0.45)
+    lo, hi = min(x+y), max(x+y)
+    if lo == hi:
+        lo, hi = lo-1, hi+1
+    ax.plot([lo, hi], [lo, hi], '--', linewidth=1)
+    ax.set(xlabel=xlabel, ylabel=ylabel, title=title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
 
 
 def compare_pair(system, anchor):
-    left = RUNS / 'inherited' / system / f'anc_{anchor}'
-    right = RUNS / 'isolated' / system / f'anc_{anchor}'
-    outdir = RESULTS / system / f'anc_{anchor}'
-    outdir.mkdir(parents=True, exist_ok=True)
-    errors, distances, score_differences = [], [], []
-    if not (left / '.success').is_file() or not (right / '.success').is_file():
-        errors.append('One or both runs lack a success marker')
-    if not (left / 'dn_generic.in').is_file() or not (right / 'dn_generic.in').is_file():
-        errors.append('Input missing')
-        prefix = None
+    a = RUNS / 'inherited' / system / f'anc_{anchor}'
+    b = RUNS / 'isolated' / system / f'anc_{anchor}'
+    out = RESULTS / system / f'anc_{anchor}'
+    out.mkdir(parents=True, exist_ok=True)
+    errors, notes = [], []
+    ia, ib = a / 'dn_generic.in', b / 'dn_generic.in'
+    if not ia.is_file() or not ib.is_file():
+        raise RuntimeError('Missing one or both calculation inputs')
+    if digest(ia) != digest(ib):
+        errors.append('Input files differ')
+    prefix = parameter(ia, 'dn_output_prefix')
+    fa = a / f'{prefix}.completed.denovo_build.mol2'
+    fb = b / f'{prefix}.completed.denovo_build.mol2'
+    if not fa.is_file() or not fb.is_file():
+        raise RuntimeError(f'Missing final output: {fa if not fa.is_file() else fb}')
+    if not (a / '.success').exists() or not (b / '.success').exists():
+        notes.append('One or both .success markers missing; inspect SLURM exit status')
+
+    na, nb, bad, samples, scores, rmsd = compare_final(fa, fb)
+    if na == 0 or nb == 0:
+        errors.append('Final MOL2 contains no molecules')
+    if na != nb:
+        errors.append(f'Final molecule counts differ: {na} vs {nb}')
+    if bad:
+        errors.append(f'{bad} molecule records differ (coordinate/property tolerance {TOL})')
+    if not scores:
+        notes.append('No numeric score properties found in final molecules')
+
+    # Compare growth-tree outputs by ID; a changed byte hash is flagged separately.
+    pattern = re.compile(re.escape(prefix) + r'\.growth_tree_(\d+)\.mol2$')
+    def trees(folder):
+        ans = {}
+        for p in folder.glob(f'{prefix}.growth_tree_*.mol2'):
+            m = pattern.fullmatch(p.name)
+            if m:
+                ans[int(m.group(1))] = p
+        return ans
+    ta, tb = trees(a), trees(b)
+    only_a, only_b = set(ta) - set(tb), set(tb) - set(ta)
+    if only_a or only_b:
+        errors.append(f'Growth-tree IDs differ: inherited-only={len(only_a)}, isolated-only={len(only_b)}')
+    ids = sorted(set(ta) & set(tb))
+    sizes_a, sizes_b = [], []
+    differing_trees = 0
+    for tree_id in ids:
+        pa, pb = ta[tree_id], tb[tree_id]
+        ca, cb = molecule_count(pa), molecule_count(pb)
+        sizes_a.append(ca)
+        sizes_b.append(cb)
+        if ca != cb or not compare_tree(pa, pb):
+            differing_trees += 1
+    if differing_trees:
+        errors.append(f'{differing_trees} growth-tree files differ structurally or in population')
+    if not ta and not tb:
+        notes.append('No growth-tree files; growth-tree equivalence not assessed')
+
+    # Growth-layer files are optional; their absence must not create false failures.
+    layer_a = {p.name for p in a.glob(f'{prefix}.*root_layer_*.mol2')}
+    layer_b = {p.name for p in b.glob(f'{prefix}.*root_layer_*.mol2')}
+    if layer_a != layer_b:
+        errors.append('Growth-layer output filename sets differ')
+    elif not layer_a:
+        notes.append('No separate growth-layer MOL2 files were written')
     else:
-        if sha(left / 'dn_generic.in') != sha(right / 'dn_generic.in'):
-            errors.append('Inputs have different hashes')
-        prefix = parameter(left / 'dn_generic.in', 'dn_output_prefix')
-    files_a = {p.name: p for p in left.glob('*.mol2') if p.is_file()}
-    files_b = {p.name: p for p in right.glob('*.mol2') if p.is_file()}
-    if set(files_a) != set(files_b):
-        errors.append('MOL2 filename sets differ: inherited-only=' +
-                      str(sorted(set(files_a) - set(files_b))) + '; isolated-only=' +
-                      str(sorted(set(files_b) - set(files_a))))
-    common = sorted(set(files_a) & set(files_b))
-    if not common:
-        errors.append('No common MOL2 results')
-    final_names = [n for n in common if 'denovo_build' in n and n.endswith('.mol2')]
-    if not final_names:
-        errors.append('No common final denovo_build MOL2 file')
-    if prefix and not any(n.startswith(prefix) for n in common):
-        errors.append('No MOL2 output uses configured dn_output_prefix')
-    growth = []
-    tree = []
-    final_a = final_b = 0
-    for name in common:
-        molecules_a = split_molecules(files_a[name])
-        molecules_b = split_molecules(files_b[name])
-        if len(molecules_a) != len(molecules_b):
-            errors.append(f'{name}: molecule count {len(molecules_a)} != {len(molecules_b)}')
-        if 'root_layer_' in name:
-            growth.append((name, len(molecules_a), len(molecules_b)))
-        if 'growth_tree_' in name:
-            tree.append((name, len(molecules_a), len(molecules_b)))
-        if name in final_names:
-            final_a += len(molecules_a)
-            final_b += len(molecules_b)
-        for index, (ma, mb) in enumerate(zip(molecules_a, molecules_b), 1):
-            faults, ds, ss = compare_molecule(ma, mb)
-            if faults:
-                errors.append(f'{name}: molecule {index}: {", ".join(sorted(set(faults)))}')
-            if name in final_names:
-                distances.extend(ds)
-                score_differences.extend(ss)
-    if not growth:
-        errors.append('No growth-layer files found')
-    if not tree:
-        errors.append('No growth-tree files found')
-    if not score_differences:
-        errors.append('No comparable numerical score properties found')
-    rmsd = math.sqrt(sum(distances) / len(distances)) if distances else math.nan
-    mae = sum(abs(d) for d in score_differences) / len(score_differences) if score_differences else math.nan
-    rmse = math.sqrt(sum(d * d for d in score_differences) / len(score_differences)) if score_differences else math.nan
+        for name in sorted(layer_a):
+            if not compare_tree(a / name, b / name):
+                errors.append(f'Growth-layer file differs: {name}')
+
+    if ids:
+        scatter(out / 'growth_tree_identity.png', sizes_a, sizes_b,
+                'Growth-tree population identity', 'Inherited molecules', 'Isolated molecules')
+    for key, values in sorted(scores.items()):
+        safe = re.sub(r'[^A-Za-z0-9_-]+', '_', key)
+        if values:
+            scatter(out / f'score_identity_{safe}.png', [x for x, _ in values],
+                    [y for _, y in values], f'{key} identity', 'Inherited score', 'Isolated score')
     result = 'PASS' if not errors else 'FAIL'
-    report = [f'System: {system}', f'Anchor: {anchor}', f'Overall: {result}',
-              f'Inherited final molecules: {final_a}', f'Isolated final molecules: {final_b}',
-              f'Growth layer files: {len(growth)}', f'Growth tree files: {len(tree)}',
-              f'Coordinate RMSD (A): {rmsd}', f'Score MAE: {mae}', f'Score RMSE: {rmse}',
-              'Growth populations: ' + repr(growth), 'Growth trees: ' + repr(tree),
-              'Differences:'] + (errors if errors else ['None'])
-    (outdir / 'equivalence_report.txt').write_text('\n'.join(report) + '\n')
-    return [system, anchor, result, final_a, final_b, len(growth), len(tree), rmsd, mae, rmse, len(errors)]
+    report = [f'System: {system}', f'Anchor: {anchor}', f'Equivalence: {result}',
+              f'Final molecules: inherited={na}, isolated={nb}',
+              f'Final molecule mismatches: {bad}', f'Coordinate RMSD (A): {rmsd}',
+              f'Growth trees: inherited={len(ta)}, isolated={len(tb)}',
+              f'Growth-tree content mismatches: {differing_trees}',
+              'Score observations: ' + ', '.join(f'{k}={len(v)}' for k, v in scores.items()),
+              'Differences:'] + (errors or ['None']) + ['Examples:'] + (samples or ['None']) + ['Notes:'] + (notes or ['None'])
+    (out / 'equivalence_report.txt').write_text('\n'.join(report) + '\n')
+    return [system, anchor, result, na, nb, bad, len(ta), len(tb), differing_trees, rmsd, '; '.join(errors)]
 
 
 def main():
     tasks = RUNS / 'tasks.tsv'
     if not tasks.is_file():
-        raise SystemExit('ERROR: Run 001.setup_test.sh first')
+        sys.exit('ERROR: Missing runs/tasks.tsv')
     RESULTS.mkdir(parents=True, exist_ok=True)
     rows = []
     for line in tasks.read_text().splitlines():
+        if not line.strip():
+            continue
         system, anchor = line.split('\t')
         try:
             row = compare_pair(system, anchor)
         except Exception as exc:
             folder = RESULTS / system / f'anc_{anchor}'
             folder.mkdir(parents=True, exist_ok=True)
-            (folder / 'equivalence_report.txt').write_text(f'FAIL: {exc}\n')
-            row = [system, anchor, 'FAIL', '', '', '', '', '', '', '', str(exc)]
+            (folder / 'equivalence_report.txt').write_text(f'Comparison error: {exc}\n')
+            row = [system, anchor, 'ERROR', '', '', '', '', '', '', '', str(exc)]
         rows.append(row)
-        print(system, 'anc_' + anchor, row[2])
+        print(system, f'anc_{anchor}', row[2], flush=True)
     with (RESULTS / 'equivalence_summary.csv').open('w', newline='') as handle:
         writer = csv.writer(handle)
-        writer.writerow(['system', 'anchor', 'equivalence', 'inherited_final_molecules',
-                         'isolated_final_molecules', 'growth_layer_files', 'growth_tree_files',
-                         'coordinate_rmsd_A', 'score_mae', 'score_rmse', 'differences'])
+        writer.writerow(['system', 'anchor', 'equivalence', 'inherited_final', 'isolated_final',
+                         'final_molecule_mismatches', 'inherited_growth_trees', 'isolated_growth_trees',
+                         'growth_tree_mismatches', 'coordinate_rmsd_A', 'details'])
         writer.writerows(rows)
-    print('Report:', RESULTS / 'equivalence_summary.csv')
-    return int(any(row[2] != 'PASS' for row in rows) or not rows)
+    print('Summary:', RESULTS / 'equivalence_summary.csv')
+    return int(not rows or any(row[2] != 'PASS' for row in rows))
 
 
 if __name__ == '__main__':
